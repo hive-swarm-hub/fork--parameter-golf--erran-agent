@@ -65,12 +65,8 @@ class Hyperparameters:
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     p for p in os.environ.get("CONTROL_TENSOR_NAME_PATTERNS",
     "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,ve_layer_scales,ve_shared.scale").split(",") if p)
-INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = CONTROL_TENSOR_NAME_PATTERNS
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
-INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_Q = 99.99984 / 100.0
-def tensor_nbytes(t: Tensor) -> int: return int(t.numel()) * int(t.element_size())
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     was_2d = G.ndim == 2
@@ -205,12 +201,6 @@ def eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens
     vl = vls / vtc; bpt = vl.item() / math.log(2.0); tpb = vtc.item() / vbc.item()
     model.train()
     return float(vl.item()), float(bpt * tpb)
-def keep_float_tensor(name, t, po):
-    if any(p in name for p in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS): return t.float().contiguous()
-    if t.dtype in {torch.float32, torch.bfloat16}:
-        po[name] = str(t.dtype).removeprefix("torch.")
-        return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
-    return t
 def quantize_float_tensor(t):
     t32 = t.float()
     if t32.ndim == 2:
@@ -223,40 +213,6 @@ def quantize_float_tensor(t):
     s = torch.tensor(ca / 127.0 if ca > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -ca, ca) / s), -127, 127).to(torch.int8).contiguous()
     return q, s
-def quantize_state_dict_int8(sd):
-    quantized, scales, dtypes, passthrough = {}, {}, {}, {}
-    po, qmeta = {}, {}
-    stats = dict.fromkeys(("param_count","num_tensors","num_float_tensors","num_nonfloat_tensors","baseline_tensor_bytes","int8_payload_bytes"), 0)
-    for name, tensor in sd.items():
-        t = tensor.detach().to("cpu").contiguous()
-        stats["param_count"] += int(t.numel()); stats["num_tensors"] += 1
-        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
-        if not t.is_floating_point():
-            stats["num_nonfloat_tensors"] += 1; passthrough[name] = t; stats["int8_payload_bytes"] += tensor_nbytes(t); continue
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            kept = keep_float_tensor(name, t, po); passthrough[name] = kept; stats["int8_payload_bytes"] += tensor_nbytes(kept); continue
-        stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
-        if s.ndim > 0: qmeta[name] = {"scheme": "per_row", "axis": 0}
-        quantized[name] = q; scales[name] = s; dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
-    obj = {"__quant_format__": "int8_clean_per_row_v1", "quantized": quantized, "scales": scales, "dtypes": dtypes, "passthrough": passthrough}
-    if qmeta: obj["qmeta"] = qmeta
-    if po: obj["passthrough_orig_dtypes"] = po
-    return obj, stats
-def dequantize_state_dict_int8(obj):
-    out, qmeta, po = {}, obj.get("qmeta", {}), obj.get("passthrough_orig_dtypes", {})
-    for name, q in obj["quantized"].items():
-        dtype = getattr(torch, obj["dtypes"][name]); s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
-            out[name] = (q.float() * s.to(torch.float32).view(q.shape[0], *([1]*(q.ndim-1)))).to(dtype=dtype).contiguous()
-        else: out[name] = (q.float() * float(s.item())).to(dtype=dtype).contiguous()
-    for name, t in obj["passthrough"].items():
-        out_t = t.detach().to("cpu").contiguous()
-        od = po.get(name)
-        if isinstance(od, str): out_t = out_t.to(dtype=getattr(torch, od)).contiguous()
-        out[name] = out_t
-    return out
 class TokenStream:
     def __init__(self, pattern):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
