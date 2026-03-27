@@ -3,7 +3,11 @@ import copy, glob, io, lzma, math, os, random, subprocess, sys, time, uuid, zlib
 from pathlib import Path
 import numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
 from torch import Tensor, nn
-from flash_attn_interface import flash_attn_func as flash_attn_3_func
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+    HAS_FA3 = True
+except ImportError:
+    HAS_FA3 = False
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -358,7 +362,14 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        if HAS_FA3:
+            y = flash_attn_3_func(q, k, v, causal=True)
+        else:
+            q2 = q.transpose(1, 2); k2 = k.transpose(1, 2); v2 = v.transpose(1, 2)
+            if self.num_kv_heads != self.num_heads:
+                rep = self.num_heads // self.num_kv_heads
+                k2 = k2.repeat_interleave(rep, dim=1); v2 = v2.repeat_interleave(rep, dim=1)
+            y = F.scaled_dot_product_attention(q2, k2, v2, is_causal=True).transpose(1, 2)
         if self.use_xsa: y = self._xsa_efficient(y, v)
         return F.linear(y.reshape(bsz, seqlen, dim), out_w.to(x.dtype))
 class SmearGate(nn.Module):
@@ -712,7 +723,8 @@ def main():
     master_process = rank == 0
     torch.backends.cuda.matmul.allow_tf32 = True; torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
-    enable_cudnn_sdp(False); enable_flash_sdp(True); enable_mem_efficient_sdp(False); enable_math_sdp(False)
+    if HAS_FA3:
+        enable_cudnn_sdp(False); enable_flash_sdp(True); enable_mem_efficient_sdp(False); enable_math_sdp(False)
     logfile = None
     if master_process: os.makedirs("logs", exist_ok=True); logfile = f"logs/{args.run_id}.txt"; print(logfile)
     def log0(msg, console=True):
