@@ -52,7 +52,7 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
-    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
+    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))
@@ -899,7 +899,7 @@ def main():
     unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
     quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"})
     quant_buf = io.BytesIO(); torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
-    quant_blob = lzma.compress(quant_buf.getvalue(), preset=6)
+    quant_blob = lzma.compress(quant_buf.getvalue(), preset=9)
     if master_process:
         with open("final_model.int6.ptz", "wb") as f: f.write(quant_blob)
         qfb = len(quant_blob); cb = len(code.encode("utf-8"))
