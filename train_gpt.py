@@ -794,6 +794,33 @@ def main():
         if isinstance(m, CastedLinear): m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
+    ttt_lr, ttt_epochs = 0.0008, 25
+    ttt_seq_len = args.train_seq_len; total_val = val_tokens.numel() - 1
+    ttt_seqs = total_val // ttt_seq_len; ttt_bs = 32
+    if ttt_seqs > 0 and ttt_epochs > 0:
+        log0(f"ttt:start lr={ttt_lr} epochs={ttt_epochs} seqs={ttt_seqs}")
+        ttt_t0 = time.perf_counter()
+        eval_model.train()
+        ttt_opt = torch.optim.AdamW(eval_model.parameters(), lr=ttt_lr, weight_decay=0.0)
+        ms_ttt = (ttt_seqs * rank) // world_size; me_ttt = (ttt_seqs * (rank + 1)) // world_size
+        for ep in range(ttt_epochs):
+            for bs in range(ms_ttt, me_ttt, ttt_bs):
+                be = min(bs + ttt_bs, me_ttt)
+                st = bs * ttt_seq_len; et = be * ttt_seq_len + 1
+                if et > val_tokens.numel(): continue
+                local = val_tokens[st:et].to(device=device, dtype=torch.int64)
+                x, y = local[:-1].reshape(-1, ttt_seq_len), local[1:].reshape(-1, ttt_seq_len)
+                ttt_opt.zero_grad(set_to_none=True)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    loss = eval_model(x, y)
+                loss.backward()
+                if distributed:
+                    for p in eval_model.parameters():
+                        if p.grad is not None: dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                ttt_opt.step()
+            if rank == 0: log0(f"  ttt_epoch {ep+1}/{ttt_epochs} time={time.perf_counter()-ttt_t0:.1f}s")
+        eval_model.eval()
+        log0(f"ttt:done elapsed={time.perf_counter()-ttt_t0:.1f}s")
     compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
     torch.cuda.synchronize(); t_qeval = time.perf_counter()
     q_vl, q_vbpb = eval_val(args, compiled_eval, rank, world_size, device, grad_accum_steps, val_tokens, bl, hl, il, eval_seq_len=effective_eval_seq_len)
