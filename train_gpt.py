@@ -62,14 +62,6 @@ class Hyperparameters:
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
-    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
-    ttt_lr = float(os.environ.get("TTT_LR", 0.002))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
-    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
-    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
-    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
-    ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
-    ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     p for p in os.environ.get("CONTROL_TENSOR_NAME_PATTERNS",
     "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,ve_layer_scales,ve_shared.scale").split(",") if p)
@@ -558,85 +550,6 @@ def eval_val_sliding(args, base_model, rank, world_size, device, val_tokens, bl,
     vl = (ls / tc).item(); bpt = vl / math.log(2.0); tpb = tc.item() / bc.item()
     base_model.train()
     return vl, bpt * tpb
-def eval_val_sliding_ttt(args, base_model, rank, world_size, device, val_tokens, bl, hl, il, stride, batch_seqs=32, log0=print):
-    seq_len = args.train_seq_len; total_tokens = val_tokens.numel() - 1; ttt_chunk = args.ttt_chunk_tokens
-    ws_list = [ws for ws in range(0, total_tokens, stride) if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0]
-    num_chunks = (total_tokens + ttt_chunk - 1) // ttt_chunk
-    chunk_windows = [[] for _ in range(num_chunks)]
-    for ws in ws_list:
-        end = min(ws + seq_len, total_tokens); wlen = end - ws
-        s = 0 if ws == 0 else max(wlen - stride, 0)
-        ci = min((ws + s) // ttt_chunk, num_chunks - 1); chunk_windows[ci].append(ws)
-    log0(f"ttt_sliding:start chunks={num_chunks} chunk_tokens={ttt_chunk} total_windows={len(ws_list)} stride={stride} ttt_lr={args.ttt_lr} ttt_epochs={args.ttt_epochs} freeze_blocks={args.ttt_freeze_blocks}")
-    ls = torch.zeros((), device=device, dtype=torch.float64)
-    tc = torch.zeros((), device=device, dtype=torch.float64)
-    bc = torch.zeros((), device=device, dtype=torch.float64)
-    frozen_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
-    ttt_params = []
-    for name, p in base_model.named_parameters():
-        freeze = any(f"blocks.{bi}." in name for bi in frozen_ids)
-        p.requires_grad_(not freeze)
-        if not freeze: ttt_params.append(p)
-    log0(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
-    optimizer = torch.optim.AdamW(ttt_params, lr=args.ttt_lr, betas=(0.9, args.ttt_momentum), weight_decay=0.01)
-    t0 = time.perf_counter()
-    for ci in range(num_chunks):
-        windows = chunk_windows[ci]
-        if not windows: continue
-        chunk_start, chunk_end = ci * ttt_chunk, min((ci + 1) * ttt_chunk, total_tokens)
-        ms, me = (len(windows) * rank) // world_size, (len(windows) * (rank + 1)) // world_size
-        my_windows = windows[ms:me]
-        base_model.eval()
-        with torch.inference_mode():
-            for bi in range(0, len(my_windows), batch_seqs):
-                bws = my_windows[bi:bi+batch_seqs]; bsz = len(bws)
-                xb = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-                yb = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device); wlens = []
-                for i, ws in enumerate(bws):
-                    end = min(ws + seq_len, total_tokens); wlen = end - ws; wlens.append(wlen)
-                    ct = val_tokens[ws:end+1].to(dtype=torch.int64, device=device)
-                    xb[i, :wlen] = ct[:-1]; yb[i, :wlen] = ct[1:]
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = base_model.forward_logits(xb)
-                nll = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), yb.reshape(-1), reduction="none").reshape(bsz, seq_len)
-                for i, ws in enumerate(bws):
-                    wlen = wlens[i]; s = 0 if ws == 0 else max(wlen - stride, 0)
-                    ls += nll[i, s:wlen].to(torch.float64).sum(); tc += float(wlen - s)
-                    tgt, prev = yb[i, s:wlen], xb[i, s:wlen]
-                    tb = bl[tgt].to(torch.float64); tb += (hl[tgt] & ~il[prev]).to(torch.float64); bc += tb.sum()
-        is_last = (ci == num_chunks - 1)
-        if not is_last and args.ttt_epochs > 0:
-            base_model.train(); chunk_seqs = (chunk_end - chunk_start) // seq_len
-            if chunk_seqs > 0:
-                cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
-                for pg in optimizer.param_groups: pg['lr'] = cos_lr
-                mss = (chunk_seqs * rank) // world_size; mse = (chunk_seqs * (rank + 1)) // world_size
-                for _ep in range(args.ttt_epochs):
-                    for bs in range(0, mse - mss, args.ttt_batch_seqs):
-                        be = min(bs + args.ttt_batch_seqs, mse - mss)
-                        st = chunk_start + (mss + bs) * seq_len; et = chunk_start + (mss + be) * seq_len + 1
-                        if et > val_tokens.numel(): continue
-                        local = val_tokens[st:et].to(device=device, dtype=torch.int64)
-                        x, y = local[:-1].reshape(-1, seq_len), local[1:].reshape(-1, seq_len)
-                        optimizer.zero_grad(set_to_none=True)
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            loss = base_model(x, y)
-                        loss.backward()
-                        if world_size > 1:
-                            for p in ttt_params:
-                                if p.grad is not None: dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-                        torch.nn.utils.clip_grad_norm_(ttt_params, args.ttt_grad_clip)
-                        optimizer.step()
-        if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
-            rl = ls.item() / max(tc.item(), 1); rbpb = rl / math.log(2.0) * (tc.item() / max(bc.item(), 1)) if tc.item() > 0 else 0.0
-            log0(f"  ttt_chunk [{ci+1}/{num_chunks}] bpb={rbpb:.6f} time={time.perf_counter()-t0:.1f}s")
-    if dist.is_available() and dist.is_initialized():
-        for t in [ls, tc, bc]: dist.all_reduce(t, op=dist.ReduceOp.SUM)
-    vl = (ls / tc).item(); vbpb = vl / math.log(2.0) * (tc.item() / bc.item())
-    for p in base_model.parameters(): p.requires_grad_(True)
-    base_model.eval()
-    log0(f"ttt_sliding:done val_loss={vl:.6f} val_bpb={vbpb:.6f} elapsed={time.perf_counter()-t0:.1f}s")
-    return vl, vbpb
 def _classify_param(name):
     if "tok_emb" in name or "lm_head" in name: return "embed"
     if ".mlp." in name: return "mlp"
@@ -946,12 +859,6 @@ def main():
         log0(f"final_int6_sliding_window_s64 val_loss:{s64_vl:.4f} val_bpb:{s64_vbpb:.4f} stride:64")
         log0(f"final_int6_sliding_window_s64_exact val_loss:{s64_vl:.8f} val_bpb:{s64_vbpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{s64_vl:.8f} val_bpb:{s64_vbpb:.8f}")
-    if args.ttt_enabled:
-        torch.cuda.synchronize(); t_ttt = time.perf_counter()
-        ttt_l, ttt_b = eval_val_sliding_ttt(args, eval_model, rank, world_size, device, val_tokens, bl, hl, il, stride=args.eval_stride, log0=log0)
-        torch.cuda.synchronize()
-        log0(f"legal_ttt val_loss:{ttt_l:.4f} val_bpb:{ttt_b:.4f} eval_time:{1000.0*(time.perf_counter()-t_ttt):.0f}ms")
-        log0(f"legal_ttt_exact val_loss:{ttt_l:.8f} val_bpb:{ttt_b:.8f}")
     if distributed: dist.destroy_process_group()
 if __name__ == "__main__":
     main()
