@@ -19,7 +19,7 @@ class Hyperparameters:
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1300))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1400))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -794,7 +794,7 @@ def main():
         if isinstance(m, CastedLinear): m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    ttt_lr, ttt_epochs = 0.001, 80
+    ttt_lr, ttt_epochs = 0.001, 100
     ttt_seq_len = args.train_seq_len; total_val = val_tokens.numel() - 1
     ttt_seqs = total_val // ttt_seq_len; ttt_bs = 32
     if ttt_seqs > 0 and ttt_epochs > 0:
