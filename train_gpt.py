@@ -794,7 +794,7 @@ def main():
         if isinstance(m, CastedLinear): m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    ttt_lr, ttt_epochs = 0.0008, 25
+    ttt_lr, ttt_epochs = 0.0008, 35
     ttt_seq_len = args.train_seq_len; total_val = val_tokens.numel() - 1
     ttt_seqs = total_val // ttt_seq_len; ttt_bs = 32
     if ttt_seqs > 0 and ttt_epochs > 0:
