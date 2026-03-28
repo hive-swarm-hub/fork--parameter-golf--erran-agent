@@ -794,7 +794,7 @@ def main():
         if isinstance(m, CastedLinear): m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    ttt_lr, ttt_epochs = 0.0008, 35
+    ttt_lr, ttt_epochs = 0.001, 40
     ttt_seq_len = args.train_seq_len; total_val = val_tokens.numel() - 1
     ttt_seqs = total_val // ttt_seq_len; ttt_bs = 32
     if ttt_seqs > 0 and ttt_epochs > 0:
@@ -804,6 +804,8 @@ def main():
         ttt_opt = torch.optim.AdamW(eval_model.parameters(), lr=ttt_lr, weight_decay=0.0)
         ms_ttt = (ttt_seqs * rank) // world_size; me_ttt = (ttt_seqs * (rank + 1)) // world_size
         for ep in range(ttt_epochs):
+            cos_lr = ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ep / ttt_epochs))
+            for pg in ttt_opt.param_groups: pg['lr'] = cos_lr
             for bs in range(ms_ttt, me_ttt, ttt_bs):
                 be = min(bs + ttt_bs, me_ttt)
                 st = bs * ttt_seq_len; et = be * ttt_seq_len + 1
